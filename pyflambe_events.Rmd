@@ -1,0 +1,393 @@
+---
+title: "Pytorch + Caffe2 = PyFlambe!"
+author: "Augustina Ragwitz"
+date: "July 9, 2018"
+output: html_document
+params:
+  downloads_folder: "~/Downloads/"
+  gh_id: !r Sys.getenv("API_KEY_GITHUB_ID")
+  gh_secret: !r Sys.getenv("API_KEY_GITHUB_SECRET")
+  gh_token: !r Sys.getenv("API_KEY_GITHUB_TOKEN")
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r includes, message=FALSE}
+
+library(ggthemes)
+library(lubridate)
+library(scales)
+library(tidyverse)
+
+ggplot_scale <- c("navyblue", "tan4", "chartreuse4", "blueviolet", "blue", "deeppink4", "goldenrod", "violetred", "turquoise2", "lightgreen", "lightpink1", "yellow1", "slategrey", "peachpuff2", "mediumorchid4", "mediumspringgreen", "tomato")
+
+```
+
+
+# Overview
+
+Facebook recently announced the merging of the PyTorch and Caffe2 projects. This announcement increased interest within the data science and tech community regarding the nature of engagement in these projects and how it might impact the open source data science community.
+
+The goal of this analysis is to determine who the key contributors to these projects are at both an organizational and individual level.
+
+# Data
+
+## Github Events
+
+[Query](https://bigquery.cloud.google.com/savedquery/306220071795:137fe3b807e24a77aef3809dbfce3593)
+
+```
+SELECT * 
+FROM [githubarchive:month.201806],[githubarchive:month.201805], [githubarchive:month.201804], [githubarchive:month.201803], [githubarchive:month.201802], [githubarchive:month.201801] 
+WHERE org.login IN('pytorch', 'caffe2')
+```
+
+[Data Archive](https://storage.googleapis.com/open_source_community_metrics_exports/201807_pyflambe_events/000000000000.csv)
+
+```{r github_events_archive, eval=FALSE, message=FALSE}
+
+# big file (~500 MB), might want to do this outside of this notebook
+# gh_events_archive <- read_csv("https://storage.googleapis.com/open_source_community_metrics_exports/201807_pyflambe_events/000000000000.csv")
+
+# if manually downloading, update params to your download folder location
+gh_events_archive <- read_csv(paste0(params$downloads_folder, "000000000000.csv"))
+write_rds(gh_events_archive, "data/downloaded/gh_events_archive.Rds")
+```
+
+
+## Actor Emails via Github API
+
+Get email addresses for the actors in the event log via the Github API.
+
+```{r gh_api_logins, eval=FALSE, message=FALSE}
+
+# get events list
+gh_events_archive <- read_rds("data/downloaded/gh_events_archive.Rds")
+
+# make a list of actors
+gh_logins <- gh_events_archive %>%
+  mutate(is_push = type == "PushEvent", is_pr == "PullRequestEvent") %>%
+  group_by(actor_login, actor_url) %>%
+  summarize(has_push = any(is_push), 
+            has_pr = any(is_pr))
+
+# for actors with push events, extract from the payload from the latest event
+actors_push <- gh_logins %>%
+  filter(has_push) %>%
+  inner_join(gh_events_archive %>% filter(type == "PushEvent")) %>%
+  group_by(actor_login) # %>%
+  # TODO extract email from payload
+  
+  # summarize to dedupe
+
+# TODO: for actors with pr events but no push, get the sha so we can look up email from commit info
+
+# TODO: for actors with no push nor pr events, get github profile info
+
+```
+
+## Domain Lookup
+
+Use the Clearbit API to look up domain name information.
+
+```{r clearbit_api_domains, eval=FALSE, message=FALSE}
+
+# domain_info <- read_rds("https://github.com/countering-bean-counting/git-commit-log-engagement/raw/master/deep-learning-frameworks-commit-log/data/dl-frameworks_domain-lookup.Rds")
+
+domain_lookup <- read_rds(paste0(params$downloads_folder, "dl-frameworks_domain-lookup.Rds"))
+write_rds(domain_lookup, "data/downloaded/clearbit_domain_lookup.Rds")
+```
+
+## Summary
+
+```{r repo-events, message=FALSE}
+
+gh_events_archive <- read_rds("data/downloaded/gh_events_archive.Rds")
+
+# phase 1 - org, repo, type, actor, date, id
+repo_events <-  gh_events_archive %>%
+  select(repo_name, type, actor_login, created_at, id) %>%
+  # convert the date to month
+  mutate(created_at = as.POSIXct(created_at),
+         event_month = floor_date(created_at, unit = "months")) %>%
+  # split repo + org into columns
+  separate(repo_name, c("org", "repo")) %>%
+  select(event_month, org, repo, type, actor=actor_login, id)
+
+write_rds(repo_events, "data/Rds/repo_events.Rds")
+write_csv(repo_events, "data/csv/repo_events.csv")
+```
+
+```{r repo-events-summary, message=FALSE}
+
+repo_events_summary <- repo_events %>%
+  group_by(org, repo, event_month, type) %>%
+  summarize(events=n(),
+            actors=n_distinct(actor))
+
+write_rds(repo_events_summary, "data/Rds/repo_events_summary.Rds")
+write_csv(repo_events_summary, "data/csv/repo_events_summary.csv")
+```
+
+```{r actor-events-summary}
+
+event_type_scores <- read_csv('
+IssuesEvent,4
+IssueCommentEvent,2
+ForkEvent,0
+PullRequestReviewCommentEvent,2
+WatchEvent,0
+PushEvent,5
+PullRequestEvent,5
+DeleteEvent,1
+GollumEvent,3
+CreateEvent,3
+MemberEvent,1
+CommitCommentEvent,3           
+PublicEvent,1
+ReleaseEvent,1
+', col_names=c("type","event_type_score"))
+
+# group by actor
+actor_events_type_summary <- repo_events %>%
+  inner_join(event_type_scores) %>%
+  group_by(org, repo, actor, event_month, type) %>%
+  summarize(events=n(),
+            event_weight = round(log(events + first(event_type_score)))
+            ) %>%
+  group_by(org, repo, actor, event_month) %>%
+  mutate(event_type_diversity=n_distinct(type)) %>%
+  group_by(org, repo, actor, type) %>%
+  mutate(event_type_freq=n())
+
+write_csv(actor_events_type_summary, "data/csv/actor_events_type_summary.csv")
+
+# org, actor, engagement (activity interval)
+actor_engagement <- actor_events_type_summary %>%
+  group_by(org, actor, type) %>%
+  summarize(
+    event_months = n_distinct(event_month),
+    event_weight = round(median(event_weight)),
+    max_event_type_freq = max(event_type_freq),
+    event_type_most_common = type[which.max(event_type_freq)],
+    event_type_diversity = round(median(event_type_diversity))
+  )
+
+# max possible months to have an event
+event_months_max <- max(actor_engagement$event_months)
+
+actor_engagement <- actor_engagement %>% 
+  # proportion of months with an event
+  mutate(months_pct = round(event_months/event_months_max, 1),
+         engagement_score = months_pct + event_weight/50)
+
+write_rds(actor_engagement, "data/Rds/actor_engagement.Rds")
+write_csv(actor_engagement, "data/csv/actor_engagement.csv")
+```
+
+# Analysis
+
+## Distribution of Events
+
+### By Type
+
+What is normal for each event type per month on each project?
+
+```{r fig-event-distribution, fig.height=10, fig.width=12}
+
+repo_events_summary <- read_rds("data/Rds/repo_events_summary.Rds")
+# repo_events_summary <- repo_events_summary %>% mutate(event_month = month(event_month, label=TRUE))
+
+repo_event_months <- repo_events_summary %>%
+  group_by(org, repo, type) %>%
+  summarize(num_months=n(), 
+            months_pct = round(num_months/6, 2),
+            num_actors = sum(actors),
+            num_events = sum(events))
+
+# x: repo
+# y: month
+# fill: type
+# facet: org
+
+ggplot(repo_event_months, 
+       mapping = aes(x = repo, y = months_pct)) +
+  geom_bar(aes(fill = type), stat="identity", position="dodge") +
+  coord_flip() +
+  theme_classic() +
+  scale_y_continuous(labels=percent) +
+  labs(x="Repo", y="Months with Event Type (%)", fill="Event Type", 
+       title="Pytorch + Caffe2: Distribution of Events by Type") +
+  scale_fill_manual(values=ggplot_scale) +
+  facet_wrap(~ org, scales="free_y", ncol=1)
+
+
+```
+
+```{r fig-event-distribution-zoom, fig.height=10, fig.width=12}
+
+ggplot(repo_event_months %>% filter(repo %in% c("caffe2", "pytorch")), 
+       mapping = aes(x = repo, y = months_pct)) +
+  geom_bar(aes(fill = type), stat="identity", position="dodge") +
+  coord_flip() +
+  theme_classic() +
+  scale_y_continuous(labels=percent) +
+  labs(x="Repo", y="Months with Event (%)", fill="Event Type", 
+       title="Pytorch + Caffe2: Distribution of Events by Type (Main Repos Only)") +
+  scale_fill_manual(values=ggplot_scale) +
+  facet_wrap(~ org, scales="free_y", ncol=1)
+
+
+```
+
+
+### By Actor
+
+#### Event Weight Distribution
+
+```{r fig-event-weight-density, fig.width=10, fig.height=10}
+
+ggplot(actor_engagement) +
+  geom_density(aes(event_weight, colour=type)) +
+  theme_classic() +
+  labs(x="Event Weight", y="Density", 
+       title="Pytorch + Caffe2: Distribution of Event Weights") +
+  facet_wrap(~ org, ncol=1) +
+  scale_color_manual(values=ggplot_scale)
+
+```
+
+
+```{r fig-event-weight-density-top, fig.width=10, fig.height=10}
+
+event_types_filtered <- event_type_scores %>% filter(event_type_score >= 3)
+
+ggplot(actor_engagement %>% filter(type %in% event_types_filtered$type)) +
+  geom_density(aes(event_weight, color=type)) +
+  theme_classic() +
+  labs(x="Event Weight", y="Density", 
+       title="Pytorch + Caffe2: Distribution of Event Weights (Top Event Types)") +
+  facet_wrap(~ org, ncol=1) +
+  scale_color_manual(values=ggplot_scale)
+
+```
+
+#### Engagement Score Distribution
+
+```{r fig-engagement-score-density, fig.width=10, fig.height=10}
+
+ggplot(actor_engagement) +
+  geom_density(aes(engagement_score, colour=type)) +
+  theme_classic() +
+  labs(x="Engagement Score", y="Density", 
+       title="Pytorch + Caffe2: Distribution of Engagement Scores") +
+  facet_wrap(~ org, ncol=1) +
+  scale_color_manual(values=ggplot_scale)
+
+```
+
+
+```{r fig-engagement-score-density-top, fig.width=10, fig.heigh=10}
+
+event_types_filtered <- event_type_scores %>% filter(event_type_score >= 3)
+
+ggplot(actor_engagement %>% filter(type %in% event_types_filtered$type)) +
+  geom_density(aes(engagement_score, color=type)) +
+  theme_classic() +
+  labs(x="Engagement Score", y="Density", 
+       title="Pytorch + Caffe2: Distribution of Engagement Scores (Top Event Types)") +
+  facet_wrap(~ org, ncol=1) +
+  scale_color_manual(values=ggplot_scale)
+
+```
+
+#### Individual Performance
+
+What individuals were responsible for a significant proportion of events?
+
+
+```{r fig-actor-proportion, fig.height=30, fig.width=10}
+
+actor_engagement <- read_rds("data/Rds/actor_engagement.Rds")
+event_types_subset <- event_type_scores %>% 
+  filter(type %in% c("PullRequestEvent", "PullRequestCommentEvent", "IssuesEvent", "IssueCommentEvent", "PushEvent", "GollumEvent", "CommitCommentEvent"))
+
+actor_engagement_summary <- actor_engagement %>% 
+  filter(engagement_score > .5 & type %in% event_types_subset$type)
+
+ggplot(actor_engagement_summary, 
+       mapping = aes(x = actor, y = engagement_score)) +
+  geom_bar(aes(fill = org), stat="identity", position="stack") +
+  coord_flip() +
+  theme_classic() +
+  labs(y="Engagement Score", x="Actor", 
+       title="Pytorch + Caffe2: Top Actors per Event Type") +
+  facet_wrap(~ type, scales="free_y", ncol=1) +
+  scale_fill_manual(values=ggplot_scale)
+
+```
+
+#### Interconnectedness
+
+This section is TODO.
+
+Which actors received the most comments on their events?
+
+Which actors are most closely connected through interactions? (Pull Requests/Issues + Comments)
+
+### By Domain
+
+This section is TODO.
+
+Using a simple email domain lookup, look at how events are distributed by organizations.
+
+#### Unaffiliated Proportion
+
+Proportion of events that could not be affiliated with a company.
+
+```{r fig-unidentified-events, eval=FALSE}
+
+```
+
+
+#### Public
+
+```{r fig-public-domain-event-distribution, eval=FALSE}
+
+# x: repo
+# y: month
+# fill: company
+# facet: type
+
+```
+
+#### Private
+
+```{r fig-private-domain-event-distribution, eval=FALSE}
+
+# x: repo
+# y: month
+# fill: company
+# facet: type
+
+```
+
+#### Education
+
+```{r fig-edu-domain-event-distribution, eval=FALSE}
+
+# x: repo
+# y: month
+# fill: company
+# facet: type
+
+```
+
+
+# Conclusion
+
+# References
+
+
